@@ -9,6 +9,10 @@ on:
     - cron: '0 19 * * *' # Runs daily at 7 PM UTC / Midnight Pakistan time
   workflow_dispatch:      # Allows manual triggering from GitHub UI
 
+permissions:
+  contents: read
+  actions: write   # needed by the keepalive step to re-enable this workflow
+
 jobs:
 
   build:
@@ -43,3 +47,12 @@ jobs:
           tags:  |
             asimzeeshan/php:latest
             asimzeeshan/php:${{ steps.vars.outputs.TAG }}
+
+      # GitHub disables scheduled workflows after 60 days without commits.
+      # Re-enabling via the API on every run resets that timer, so the daily
+      # build keeps going without needing dummy commits.
+      - name: Keep scheduled workflow alive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable "${{ github.workflow }}" -R "${{ github.repository }}"
