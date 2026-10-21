@@ -55,4 +55,6 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow enable "${{ github.workflow }}" -R "${{ github.repository }}"
+        # The REST endpoint is idempotent; `gh workflow enable <name>` only
+        # matches disabled workflows and fails once the workflow is active.
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/docker-build.yml/enable"
