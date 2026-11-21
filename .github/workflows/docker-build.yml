@@ -154,7 +154,10 @@ jobs:
           [ -n "$SLACK_WEBHOOK" ] || exit 0
           msg="Image build FAILED: ${{ github.repository }} (${{ github.event_name }}). Nothing was published. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           [ "${{ inputs.test_failure_alert }}" = "true" ] && msg="TEST of the failure alert, please ignore. $msg"
-          curl -s -m 20 -X POST -H 'Content-Type: application/json' --data "$(python3 -c 'import json,sys;print(json.dumps({"text":sys.argv[1]}))' "$msg")" "$SLACK_WEBHOOK" >/dev/null
+          reply=$(curl -s -m 20 -w ' HTTP %{http_code}' -X POST -H 'Content-Type: application/json' --data "$(python3 -c 'import json,sys;print(json.dumps({"text":sys.argv[1]}))' "$msg")" "$SLACK_WEBHOOK")
+          echo "Slack replied: $reply"
+          # Slack answers "ok" with HTTP 200 only when the message was posted
+          [ "$reply" = "ok HTTP 200" ] || { echo "::error::Slack did not accept the alert: $reply"; exit 1; }
 
       # GitHub disables scheduled workflows after 60 days without commits.
       # Re-enabling via the API on every run resets that timer, so the daily
