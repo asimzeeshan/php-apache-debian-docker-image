@@ -59,10 +59,14 @@ jobs:
       - name: Compare with the published image
         id: diff
         run: |
+          # packages, PHP + Apache modules, PHP/Apache config files, and the image config (ENV/CMD/USER/...),
+          # so a Dockerfile change that only edits configuration is still detected and published.
           fingerprint() {
-            docker run --rm --entrypoint sh "$1" -c \
-              "dpkg-query -W -f='\${Package} \${Version}\n'; php -v | head -1; php -m; apache2ctl -M 2>/dev/null | sort" \
-              | sha256sum | cut -d' ' -f1
+            { docker run --rm --entrypoint sh "$1" -c \
+                "dpkg-query -W -f='\${Package} \${Version}\n'; php -v | head -1; php -m; apache2ctl -M 2>/dev/null | sort;
+                 find /usr/local/etc/php /etc/apache2 -type f -exec sha256sum {} + 2>/dev/null | sort"
+              docker image inspect -f '{{json .Config.Env}}{{json .Config.Cmd}}{{json .Config.Entrypoint}}{{.Config.WorkingDir}}|{{.Config.User}}|{{json .Config.ExposedPorts}}{{json .Config.Volumes}}' "$1"
+            } | sha256sum | cut -d' ' -f1
           }
           NEW=$(fingerprint "$IMAGE:candidate")
           if docker pull -q "$IMAGE:latest" >/dev/null 2>&1; then OLD=$(fingerprint "$IMAGE:latest"); else OLD=none; fi
@@ -78,12 +82,14 @@ jobs:
       - name: Vulnerability scan (fixable HIGH/CRITICAL)
         id: scan
         run: |
-          mkdir -p scan
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/scan:/scan" "$TRIVY" image -q \
+          mkdir -p scan trivy-cache
+          # download the vulnerability DB with retries, so a flaky network is not mistaken for a finding
+          for i in 1 2 3; do docker run --rm -v "$PWD/trivy-cache:/root/.cache" "$TRIVY" image --download-db-only -q && break; echo "DB download failed, retry $i"; sleep 20; done
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/trivy-cache:/root/.cache" -v "$PWD/scan:/scan" "$TRIVY" image -q --skip-db-update \
             --image-src docker --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
             --format json --output /scan/candidate.json "$IMAGE:candidate"
           if docker image inspect "$IMAGE:latest" >/dev/null 2>&1; then
-            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/scan:/scan" "$TRIVY" image -q \
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/trivy-cache:/root/.cache" -v "$PWD/scan:/scan" "$TRIVY" image -q --skip-db-update \
               --image-src docker --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
               --format json --output /scan/published.json "$IMAGE:latest"
           else echo '{}' > scan/published.json; fi
@@ -129,6 +135,15 @@ jobs:
       - name: Nothing to publish
         if: github.event_name != 'pull_request' && steps.diff.outputs.changed != 'true' && !inputs.force_push
         run: echo "### Unchanged, not published (servers keep the current image)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tell Slack when a nightly or push build fails
+        if: failure() && github.event_name != 'pull_request'
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          [ -n "$SLACK_WEBHOOK" ] || exit 0
+          msg="Image build FAILED: ${{ github.repository }} (${{ github.event_name }}). Nothing was published. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s -m 20 -X POST -H 'Content-Type: application/json' --data "$(python3 -c 'import json,sys;print(json.dumps({"text":sys.argv[1]}))' "$msg")" "$SLACK_WEBHOOK" >/dev/null
 
       # GitHub disables scheduled workflows after 60 days without commits.
       # Re-enabling via the API on every run resets that timer, so the daily
