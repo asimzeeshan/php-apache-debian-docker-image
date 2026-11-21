@@ -163,7 +163,8 @@ jobs:
           trigger = {"schedule": "nightly build", "push": "push to the main branch", "workflow_dispatch": "manual run"}.get(os.environ["EVENT"], os.environ["EVENT"])
           title = ":test_tube: *Test alert, please ignore*" if test else ":x: *Image build failed*"
           text = f"{title}\n`{os.environ['REPO']}` · {trigger} · nothing was published"
-          print(json.dumps({"channel": os.environ["SLACK_CHANNEL"], "text": f"Image build failed: {os.environ['REPO']}", "attachments": [{"color": "#9e9e9e" if test else "#d32f2f", "blocks": [
+          print(json.dumps({"channel": os.environ["SLACK_CHANNEL"], "attachments": [{"color": "#9e9e9e" if test else "#d32f2f",
+              "fallback": f"Image build failed: {os.environ['REPO']}", "blocks": [
               {"type": "section", "text": {"type": "mrkdwn", "text": text},
                "accessory": {"type": "button", "text": {"type": "plain_text", "text": "View run"}, "url": os.environ["RUN_URL"]}}]}]}))
           PY
