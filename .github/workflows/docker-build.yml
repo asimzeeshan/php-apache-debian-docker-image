@@ -150,11 +150,24 @@ jobs:
         if: failure() && github.event_name != 'pull_request'
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          IS_TEST: ${{ inputs.test_failure_alert }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.event.repository.name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           [ -n "$SLACK_WEBHOOK" ] || exit 0
-          msg="Image build FAILED: ${{ github.repository }} (${{ github.event_name }}). Nothing was published. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          [ "${{ inputs.test_failure_alert }}" = "true" ] && msg="TEST of the failure alert, please ignore. $msg"
-          reply=$(curl -s -m 20 -w ' HTTP %{http_code}' -X POST -H 'Content-Type: application/json' --data "$(python3 -c 'import json,sys;print(json.dumps({"text":sys.argv[1]}))' "$msg")" "$SLACK_WEBHOOK")
+          payload=$(python3 - <<'PY'
+          import json, os
+          test = os.environ.get("IS_TEST") == "true"
+          trigger = {"schedule": "nightly build", "push": "push to the main branch", "workflow_dispatch": "manual run"}.get(os.environ["EVENT"], os.environ["EVENT"])
+          title = ":test_tube: *Test alert, please ignore*" if test else ":x: *Image build failed*"
+          text = f"{title}\n`{os.environ['REPO']}` · {trigger} · nothing was published"
+          print(json.dumps({"text": f"Image build failed: {os.environ['REPO']}", "attachments": [{"color": "#9e9e9e" if test else "#d32f2f", "blocks": [
+              {"type": "section", "text": {"type": "mrkdwn", "text": text},
+               "accessory": {"type": "button", "text": {"type": "plain_text", "text": "View run"}, "url": os.environ["RUN_URL"]}}]}]}))
+          PY
+          )
+          reply=$(curl -s -m 20 -w ' HTTP %{http_code}' -X POST -H 'Content-Type: application/json' --data "$payload" "$SLACK_WEBHOOK")
           echo "Slack replied: $reply"
           # Slack answers "ok" with HTTP 200 only when the message was posted
           [ "$reply" = "ok HTTP 200" ] || { echo "::error::Slack did not accept the alert: $reply"; exit 1; }
