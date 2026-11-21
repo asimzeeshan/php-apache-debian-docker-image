@@ -1,5 +1,10 @@
 name: Build and Push PHP-Apache Docker Image CI
 
+# Nightly: rebuild from a freshly pulled php:8.4-apache plus Debian security fixes,
+# scan it, and publish ONLY when the image content changed and the scan shows no new
+# fixable CRITICAL vulnerability compared with the published image.
+# Pull requests build and scan but never publish.
+
 on:
   push:
     branches: [ "master" ]
@@ -7,11 +12,21 @@ on:
     branches: [ "master" ]
   schedule:
     - cron: '0 19 * * *' # Runs daily at 7 PM UTC / Midnight Pakistan time
-  workflow_dispatch:      # Allows manual triggering from GitHub UI
+  workflow_dispatch:
+    inputs:
+      force_push:
+        description: "Publish even if the image content did not change"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   actions: write   # needed by the keepalive step to re-enable this workflow
+
+env:
+  IMAGE: asimzeeshan/php
+  # Trivy pinned by digest (0.76.2). Not the trivy-action: its tags were hijacked in March 2026.
+  TRIVY: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
 
 jobs:
 
@@ -30,29 +45,96 @@ jobs:
         id: vars
         run: echo "TAG=$(date +'%Y%m%d')" >> "$GITHUB_OUTPUT"
 
+      - name: Build image (local only)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          pull: true
+          no-cache: true
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:candidate
+
+      # What the image contains: package versions, PHP version + extensions, Apache modules.
+      - name: Compare with the published image
+        id: diff
+        run: |
+          fingerprint() {
+            docker run --rm --entrypoint sh "$1" -c \
+              "dpkg-query -W -f='\${Package} \${Version}\n'; php -v | head -1; php -m; apache2ctl -M 2>/dev/null | sort" \
+              | sha256sum | cut -d' ' -f1
+          }
+          NEW=$(fingerprint "$IMAGE:candidate")
+          if docker pull -q "$IMAGE:latest" >/dev/null 2>&1; then OLD=$(fingerprint "$IMAGE:latest"); else OLD=none; fi
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          if [ "$NEW" = "$OLD" ]; then echo "changed=false" >> "$GITHUB_OUTPUT"; else echo "changed=true" >> "$GITHUB_OUTPUT"; fi
+          {
+            echo "### Image content"
+            echo "- candidate fingerprint: \`$NEW\`"
+            echo "- published fingerprint: \`$OLD\`"
+            echo "- PHP: $(docker run --rm --entrypoint php "$IMAGE:candidate" -r 'echo PHP_VERSION;')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Vulnerability scan (fixable HIGH/CRITICAL)
+        id: scan
+        run: |
+          mkdir -p scan
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/scan:/scan" "$TRIVY" image -q \
+            --image-src docker --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+            --format json --output /scan/candidate.json "$IMAGE:candidate"
+          if docker image inspect "$IMAGE:latest" >/dev/null 2>&1; then
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/scan:/scan" "$TRIVY" image -q \
+              --image-src docker --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
+              --format json --output /scan/published.json "$IMAGE:latest"
+          else echo '{}' > scan/published.json; fi
+          python3 - <<'PY'
+          import json, os
+          def ids(f, sev):
+              d = json.load(open(f))
+              return {v["VulnerabilityID"] for r in d.get("Results", []) for v in (r.get("Vulnerabilities") or []) if v["Severity"] == sev}
+          new_c, old_c = ids("scan/candidate.json", "CRITICAL"), ids("scan/published.json", "CRITICAL")
+          new_h, old_h = ids("scan/candidate.json", "HIGH"), ids("scan/published.json", "HIGH")
+          added = sorted(new_c - old_c)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as s:
+              s.write("### Fixable vulnerabilities\n")
+              s.write(f"- CRITICAL: candidate {len(new_c)}, published {len(old_c)}, fixed by this build {len(old_c - new_c)}, new {len(added)}\n")
+              s.write(f"- HIGH: candidate {len(new_h)}, published {len(old_h)}, fixed by this build {len(old_h - new_h)}\n")
+              if added: s.write("- NEW CRITICAL (blocks publishing): " + ", ".join(added) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as o:
+              o.write(f"new_critical={len(added)}\n")
+          PY
+
+      - name: Block on new fixable CRITICAL
+        if: steps.scan.outputs.new_critical != '0'
+        run: |
+          echo "::error::The candidate image adds fixable CRITICAL vulnerabilities that the published image does not have. Not publishing."
+          exit 1
+
       - name: Login to Docker Hub
+        if: github.event_name != 'pull_request' && (steps.diff.outputs.changed == 'true' || inputs.force_push)
         uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      # - name: Build the Docker image
-      #   run: docker build . --file Dockerfile --tag asimzeeshan/php:latest
+      - name: Publish
+        if: github.event_name != 'pull_request' && (steps.diff.outputs.changed == 'true' || inputs.force_push)
+        run: |
+          docker tag "$IMAGE:candidate" "$IMAGE:latest"
+          docker tag "$IMAGE:candidate" "$IMAGE:${{ steps.vars.outputs.TAG }}"
+          docker push -q "$IMAGE:latest"
+          docker push -q "$IMAGE:${{ steps.vars.outputs.TAG }}"
+          echo "### Published \`$IMAGE:latest\` and \`$IMAGE:${{ steps.vars.outputs.TAG }}\`" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Build and Push Docker Image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: true
-          tags:  |
-            asimzeeshan/php:latest
-            asimzeeshan/php:${{ steps.vars.outputs.TAG }}
+      - name: Nothing to publish
+        if: github.event_name != 'pull_request' && steps.diff.outputs.changed != 'true' && !inputs.force_push
+        run: echo "### Unchanged, not published (servers keep the current image)" >> "$GITHUB_STEP_SUMMARY"
 
       # GitHub disables scheduled workflows after 60 days without commits.
       # Re-enabling via the API on every run resets that timer, so the daily
       # build keeps going without needing dummy commits.
       - name: Keep scheduled workflow alive
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         # The REST endpoint is idempotent; `gh workflow enable <name>` only
