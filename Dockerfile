@@ -1,4 +1,4 @@
-FROM php:8.4-apache
+FROM php:8.6-apache
 
 # Apply Debian security fixes released since the upstream php image was last built.
 RUN apt-get update \
