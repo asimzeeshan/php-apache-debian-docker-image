@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # Base image. The nightly build already picks up new php:8.4-apache builds (same tag);
+  # this only proposes a new PHP line (for example 8.5) as a PR. Nothing here auto-merges:
+  # a PHP version change affects every site on the image, so it is merged by hand.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "php"
+        update-types: ["version-update:semver-major"]
+  # GitHub Actions used by the build workflow (checkout, buildx, build-push, login).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
